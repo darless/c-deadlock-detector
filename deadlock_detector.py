@@ -25,6 +25,7 @@ class GDB:
     self.pid = pid
     self.threads = []
     self.num_locked = 0
+    self.deadlock_threads = []
 
   @property
   def base(self):
@@ -81,7 +82,7 @@ class GDB:
       if match:
         self.set_thread_name(match.group(1), match.group(2))
     self.set_locks()
-
+    self.find_deadlock()
 
   def set_thread_name(self, lwp, name):
     """Set a thread name based on the LWP that is passed in
@@ -109,7 +110,18 @@ class GDB:
               th.lock_func = frame.in_func
               break
 
-  def print_status(self, show_bt=False):
+  def find_deadlock(self):
+    """Figure out if there really is a deadlock"""
+    for th in self.threads:
+      if th.locked:
+        owner = self.thread_by_lwp(th.lock_owner_lwp)
+        if (owner and
+            owner.locked and
+            owner.lock_owner_lwp and
+            owner.lock_owner_lwp == th.lwp):
+          self.deadlock_threads.append((th, owner))
+
+  def print_status(self, show_bt=False, only_show=None):
     """Print the status of the threads
 
     Args:
@@ -118,18 +130,37 @@ class GDB:
     if not self.num_locked:
       print("There are no locked threads")
       return
+    threads = []
+    # Filter threads
     for th in self.threads:
-      if th.locked:
-        owner = self.thread_by_lwp(th.lock_owner_lwp)
+      if not th.locked:
+        continue
+      if not only_show:
+        threads.append(th)
+      if th.index in [int(x, 10) for x in only_show]:
+        threads.append(th)
+      if th.name and th.name in only_show:
+        threads.append(th)
 
-        # We want to print the back track
-        if show_bt:
-          print("=" * 80)
-        print("{} is waiting for a lock ({}) owned by {}"
-          .format(th.readable(), th.lock_func, owner.readable()))
-        if show_bt:
-          th.print_backtrace()
-          owner.print_backtrace()
+    for th in threads:
+      owner = self.thread_by_lwp(th.lock_owner_lwp)
+      if not owner:
+        print("No owner for {}".format(th.readable()))
+        continue
+
+      # We want to print the back track
+      if show_bt:
+        print("=" * 80)
+      print("{} is waiting for a lock ({}) owned by {}"
+        .format(th.readable(), th.lock_func, owner.readable()))
+      if show_bt:
+        th.print_backtrace()
+        owner.print_backtrace()
+    # Print out if there are any deadlocks
+    for dl in self.deadlock_threads:
+      print("Deadlock between {} and {}".format(
+        dl[0].readable(), dl[1].readable()))
+
 
   def thread_by_lwp(self, lwp):
     """Retrieve a thread object by LWP id
@@ -216,6 +247,7 @@ class Frame:
     self.from_file = None
     self.at_file = None
     self.locked = False
+    self.lock_type = None
     self.parse()
 
   def __str__(self):
@@ -261,9 +293,15 @@ class Frame:
         self.at_file = data[3]
     elif 'at':
       self.at_file = data[2]
-    if self.in_func and 'pthread_mutex_lock' in self.in_func:
-      self.locked = True
-      self.parse_locked_state()
+    if self.in_func:
+      if 'pthread_mutex_lock' in self.in_func:
+        self.locked = True
+        self.lock_type = 'pthread_mutex_t'
+      elif 'pthread_rwlock' in self.in_func:
+        self.locked = True
+        self.lock_type = 'pthread_rwlock_t'
+      if self.locked:
+        self.parse_locked_state()
 
   def parse_locked_state(self):
     """Fiture out what thread is causing this thread to wait"""
@@ -294,17 +332,23 @@ class Frame:
           found_special = True
           continue
         if found_special:
-          info = self.gdb.get_output("p *(pthread_mutex_t*){}".format(mem_addr))
-          match = re.search('__owner = ([0-9]*)', info).groups()
-          if match:
-            self.thread.lock_owner_lwp = match[0]
+          if self.lock_type == 'pthread_mutex_t':
+            info = self.gdb.get_output("p *(pthread_mutex_t*){}".format(mem_addr))
+            match = re.search('__owner = ([0-9]*)', info)
+            if match:
+              self.thread.lock_owner_lwp = match.groups()[0]
+            else:
+              print("No match found for thread #{} frame #{}".format(
+                self.thread.index, self.index))
+          else:
+            print("Unable to handle type {} atm".format(self.lock_type))
           break
 
 if __name__ == "__main__":
   def ap_detector(args):
     gdb = GDB(args.binary, args.pid)
     gdb.parse_thread_state()
-    gdb.print_status(show_bt=args.back_trace)
+    gdb.print_status(show_bt=args.back_trace, only_show=args.thread)
 
   def add_sp(sub_p, action, func=None, help=None):
     p = sub_p.add_parser(action, help=help)
@@ -317,5 +361,8 @@ if __name__ == "__main__":
   parser.add_argument('pid', help='PID or Core File of the process')
   parser.add_argument('-b', '--back-trace', action='store_true',
                       help='Show the back trace for locked threads')
+  parser.add_argument('-t', '--thread', action='append',
+                      default=[],
+                      help='Only show the threads provided that are locked')
   args = parser.parse_args()
   ap_detector(args)
